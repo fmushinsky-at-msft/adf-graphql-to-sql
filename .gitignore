@@ -1,0 +1,13 @@
+# Build output
+bin/
+obj/
+artifacts/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Publish profiles / local settings
+*.publishsettings
+appsettings.Development.json
