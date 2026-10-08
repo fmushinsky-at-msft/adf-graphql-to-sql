@@ -190,6 +190,7 @@ sql/
   02-source-grant-api-sami.sql  App Service SAMI -> db_datareader on the source DB
   03-dest-schema.sql            Destination tables, watermark control, etl.* procedures (idempotent)
   04-dest-grant-adf-sami.sql    ADF SAMI -> db_datareader + db_datawriter + EXECUTE ON SCHEMA::etl
+  04-dest-grant-adf-sami-prd.sql  The same grants for the production factory's SAMI
   05-source-changes.sql         Test fixture: 3 updates, 2 inserts, 2 deletes
 
 src/GraphQlApi/               .NET 10 ASP.NET Core minimal API + HotChocolate 16
@@ -198,7 +199,8 @@ src/GraphQlApi/               .NET 10 ASP.NET Core minimal API + HotChocolate 16
   Data/RestaurantRepository.cs  All SQL access, page size 30, transient-error retry
   Models/                       Restaurant, RestaurantKey, SyncWatermark, Page<T>
 
-adf/
+adf/                            The factory's first version, deployed by Deploy-Adf.ps1. The ADF Git
+                                repository is now the source of truth (see CI/CD and production).
   linkedService/                LS_GraphQlApi (anonymous REST), LS_DestinationSql (SAMI)
   dataset/                      REST source + three Azure SQL datasets
   pipeline/                     PL_Sync_Restaurants_GraphQL_To_Sql
@@ -206,7 +208,7 @@ adf/
 scripts/
   Invoke-SqlScript.ps1          Runs .sql files or inline queries with an Entra token
   Deploy-Api.ps1                Configures App Service, publishes, zip-deploys
-  Deploy-Adf.ps1                PUTs the ADF JSON via the management API
+  Deploy-Adf.ps1                PUTs the ADF JSON via the management API (first deployment only)
   Invoke-PipelineRun.ps1        Triggers the pipeline, waits, prints + returns run statistics
   Test-SyncIntegrity.ps1        SHA2-256 row fingerprint: source vs destination
   Reset-Destination.ps1         Empties the target and rewinds the watermark
@@ -236,7 +238,7 @@ cd scripts
 ./Invoke-SqlScript.ps1 -Database 'nyc-dohmh-adf-graphql-to-sql-2' -Path '../sql/03-dest-schema.sql'
 ./Invoke-SqlScript.ps1 -Database 'nyc-dohmh-adf-graphql-to-sql-2' -Path '../sql/04-dest-grant-adf-sami.sql'
 
-# 4. Deploy the Data Factory artifacts.
+# 4. Deploy the Data Factory artifacts. Only for a new factory; see "CI/CD and production".
 ./Deploy-Adf.ps1
 
 # 5. Run the pipeline.
@@ -245,6 +247,51 @@ cd scripts
 
 > `03-dest-schema.sql` is destructive by design: it drops and recreates the destination objects and
 > rewinds the watermark to `1900-01-01`, so the next run is a full load.
+
+---
+
+## CI/CD and production
+
+`Deploy-Adf.ps1` deployed the factory's first version. After that, the development factory was
+connected to Git, and its artifacts now live in their own repository,
+[adf-graphql-to-sql-adf-source](https://github.com/fmushinsky-at-msft/adf-graphql-to-sql-adf-source),
+in the collaboration branch `collab`. That repository is the source of truth for the pipeline:
+change it in ADF Studio, not in `adf/`, which is no longer updated.
+
+A GitHub Actions workflow in that repository follows the
+[new CI/CD flow](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery-improvements)
+for Azure Data Factory. It validates the artifacts and exports them as one ARM template, deploys
+the template to the development factory and, after a reviewer approves, deploys the same template
+to the production factory. Each environment's values, such as the factory and the destination
+database, come from a configuration file in that repository. Its readme describes the workflow and
+the one-time setup.
+
+| | Development | Production |
+|---|---|---|
+| Data factory | `nyc-dohmh-adf-graphql-to-sql`, connected to Git | `nyc-dohmh-adf-graphql-to-sql-prd` |
+| Destination database | `nyc-dohmh-adf-graphql-to-sql-2` | `nyc-dohmh-adf-graphql-to-sql-prd-2` |
+| Grant script for the factory's SAMI | `sql/04-dest-grant-adf-sami.sql` | `sql/04-dest-grant-adf-sami-prd.sql` |
+
+Both factories read from the same GraphQL API. Every factory has its own managed identity, so each
+environment's destination database needs the schema and a grant for that environment's factory,
+like step 3 above:
+
+```powershell
+./Invoke-SqlScript.ps1 -Database 'nyc-dohmh-adf-graphql-to-sql-prd-2' -Path '../sql/03-dest-schema.sql'
+./Invoke-SqlScript.ps1 -Database 'nyc-dohmh-adf-graphql-to-sql-prd-2' -Path '../sql/04-dest-grant-adf-sami-prd.sql'
+```
+
+The scripts default to the development environment. To run the production pipeline, compare its
+destination with the source, and empty it again:
+
+```powershell
+./Invoke-PipelineRun.ps1 -FactoryName 'nyc-dohmh-adf-graphql-to-sql-prd'
+./Test-SyncIntegrity.ps1 -DestinationDatabase 'nyc-dohmh-adf-graphql-to-sql-prd-2'
+./Reset-Destination.ps1 -Database 'nyc-dohmh-adf-graphql-to-sql-prd-2'
+```
+
+> Don't run `Deploy-Adf.ps1` against the production factory. The linked service in `adf/` points
+> to the development database, and the next workflow run would replace whatever it deployed.
 
 ---
 
@@ -421,7 +468,10 @@ from a function unrolls it into `DataRow`s unless you write `return , $table`.
 | Source database | `nyc-dohmh-adf-graphql-to-sql-1` |
 | Destination database | `nyc-dohmh-adf-graphql-to-sql-2` |
 | App Service | `nyc-dohmh-adf-graphql-to-sql` (Windows, .NET 10, 64-bit, Always On) |
-| Data Factory | `nyc-dohmh-adf-graphql-to-sql` |
+| Data Factory | `nyc-dohmh-adf-graphql-to-sql` (development, connected to Git) |
+| Production data factory | `nyc-dohmh-adf-graphql-to-sql-prd` |
+| Production destination database | `nyc-dohmh-adf-graphql-to-sql-prd-2` |
+| Deployment identities | `nyc-dohmh-adf-graphql-to-sql-gh-deploy` and `nyc-dohmh-adf-graphql-to-sql-prd-gh-deploy`: user-assigned managed identities that the GitHub workflow signs in as |
 
 The App Service reads the source database through the connection string `SourceDatabase`
 (`Authentication=Active Directory Managed Identity`). Running locally, the same connection string
