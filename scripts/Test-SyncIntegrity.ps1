@@ -105,6 +105,12 @@ Write-Host ("  source      : {0,4} row(s)  {1}" -f $sourceRows, $sourceHash)
 Write-Host ("  destination : {0,4} row(s)  {1}" -f $destRows, $destHash)
 Write-Host ''
 
+if ($sourceRows -eq 0) {
+	Write-Host 'INCONCLUSIVE - the source table is empty, so a matching destination proves nothing.' -ForegroundColor Red
+	Write-Host '               Re-run sql\01-source-schema.sql to reload the sample data.' -ForegroundColor Red
+	exit 1
+}
+
 if ($sourceHash -eq $destHash -and $sourceRows -eq $destRows) {
 	Write-Host 'MATCH - destination is an exact copy of the source.' -ForegroundColor Green
 	exit 0

@@ -184,17 +184,25 @@ BEGIN
 
 	DECLARE @mergeActions TABLE (MergeAction NVARCHAR(10) NOT NULL);
 
+	/* Both counts are DISTINCT and non-NULL on purpose, and each half matters for a different
+	   reason. Every Copy activity has a retry policy, and a retry that happens after rows were
+	   already committed leaves duplicates in staging; the merge and the delete are both set-based
+	   and already tolerate that, so counting raw rows would be the only thing in the procedure
+	   that fails a run purely because a page was retried. The staging key column is also
+	   deliberately nullable so a malformed page lands as NULL instead of failing the copy - and a
+	   raw count would count those NULLs toward the expected total, letting an incomplete key
+	   harvest pass this guard and then delete live rows. */
 	DECLARE @inserted INT = 0,
 			@updated  INT = 0,
 			@deleted  INT = 0,
-			@stagedKeyCount   INT = (SELECT COUNT_BIG(1) FROM stg.RestaurantKey),
+			@stagedKeyCount   INT = (SELECT COUNT_BIG(DISTINCT RestaurantId) FROM stg.RestaurantKey WHERE RestaurantId IS NOT NULL),
 			@stagedDeltaCount INT = (SELECT COUNT_BIG(DISTINCT RestaurantId) FROM stg.Restaurant WHERE RestaurantId IS NOT NULL);
 
 	IF @ExpectedKeyCount IS NOT NULL AND @stagedKeyCount <> @ExpectedKeyCount
 	BEGIN
 		DECLARE @message NVARCHAR(400) =
 			CONCAT(N'Key reconciliation aborted: staged ', @stagedKeyCount,
-				   N' key(s) but the source reported ', @ExpectedKeyCount,
+					   N' distinct key(s) but the source reported ', @ExpectedKeyCount,
 				   N'. Stale rows will not be deleted this run.');
 		THROW 50001, @message, 1;
 	END

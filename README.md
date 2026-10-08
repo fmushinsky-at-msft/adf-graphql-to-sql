@@ -123,6 +123,15 @@ a partial delta would be merged *and the watermark would still advance*, and the
 missed would never be revisited. Both guards fail the whole run instead of applying a partial result
 — the watermark only moves on a complete load, so any failure is recovered by simply running again.
 
+Both counts are `COUNT_BIG(DISTINCT RestaurantId)`, not `COUNT_BIG(1)`, and that distinction matters
+in both directions. Every Copy activity has a retry policy, so a retry that fires after rows were
+already committed leaves duplicates in staging; the `MERGE` and the `DELETE` are set-based and
+already tolerate that, so a raw row count would be the only thing in the procedure that fails a run
+purely because a page was retried. In the other direction, `stg.RestaurantKey.RestaurantId` is
+deliberately nullable so a malformed page lands as `NULL` rather than failing the copy — and a raw
+count would happily count those `NULL`s toward the expected total, letting an incomplete key harvest
+pass the guard and delete live rows. Counting distinct non-`NULL` keys is what closes both.
+
 **`MERGE` updates only genuinely changed rows** using `EXISTS (SELECT s.* EXCEPT SELECT t.*)`, which
 is NULL-safe, and reports counts via `OUTPUT $action`.
 
