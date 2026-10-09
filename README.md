@@ -2,9 +2,9 @@
 
 A complete, working sample that incrementally syncs data from a REST service (which exposes its
 data over **GraphQL**) into an **Azure SQL** database using **Azure Data Factory**, driven by a
-**watermark**. The pipeline inserts new rows, updates changed rows and deletes rows that no longer
-exist at the source. All authentication uses **system-assigned managed identities** — there are no
-secrets anywhere in this repository.
+**watermark**. The pipeline inserts new rows and updates changed rows. It assumes the source never
+deletes records, so nothing tracks deletions. All authentication uses **system-assigned managed
+identities** — there are no secrets anywhere in this repository.
 
 ---
 
@@ -32,7 +32,6 @@ secrets anywhere in this repository.
 										   │ Destination Azure   │
 										   │ SQL                 │
 										   │  stg.Restaurant     │
-										   │  stg.RestaurantKey  │
 										   │  dbo.Restaurant     │
 										   │  dbo.WatermarkCtrl  │
 										   └─────────────────────┘
@@ -43,13 +42,12 @@ secrets anywhere in this repository.
 | # | Activity | What it does |
 |---|----------|--------------|
 | 1 | `LookupStoredWatermark` | Reads the watermark left by the last successful run — the **exclusive lower bound** of this run's delta window. |
-| 2 | `GetSourceWatermark` | Asks the API for `MAX(LastUpdatedDateTime)` and the total row count, once. This **pins the upper bound** so offset paging stays stable even if rows change mid-run. |
+| 2 | `GetSourceWatermark` | Reads the current **source** watermark from the same `restaurants` query the load uses: it asks for the newest change after the stored watermark (`sort: LAST_UPDATED_DESC`, `skip: 0`) and takes the first row's `lastUpdatedDateTime`. `SetNewWatermark` keeps the stored value when no row comes back, because nothing has changed. This **pins the upper bound** so offset paging stays stable even if rows change mid-run. |
 | 3 | `CheckSourceWatermarkResponse` | GraphQL reports errors with HTTP 200, so a failed query looks like a successful web call. This fails the run with the actual error text instead of an opaque expression error. |
-| 4 | `GetDeltaRowCount` | Asks how many rows fall inside the window, so the load can be verified afterwards. `CheckDeltaRowCountResponse` guards this response the same way as step 3. |
-| 5 | `StartSync` | Truncates both staging tables so a run always starts clean, even after a previous failure. |
+| 4 | `GetDeltaRowCount` | Asks how many rows fall inside the window (`totalCount`), so the load can be verified afterwards. `CheckDeltaRowCountResponse` guards this response the same way as step 3. |
+| 5 | `StartSync` | Truncates the staging table so a run always starts clean, even after a previous failure. |
 | 6 | `UntilAllDeltaPagesCopied` | Pages `restaurants(updatedAfter, updatedThrough, skip)` 30 rows at a time into `stg.Restaurant`. Stops when a page returns fewer than 30 rows. |
-| 7 | `UntilAllKeyPagesCopied` | Pages `restaurantKeys(skip)` into `stg.RestaurantKey`. A watermark delta can never reveal a **deleted** row, so the full key set is reconciled separately. |
-| 8 | `ApplySync` | One transaction: verify both staged sets against the counts from steps 2 and 4, `MERGE` the delta (insert new / update genuinely changed), delete targets whose key is absent from the staged key set, and advance the watermark. Returns run statistics. |
+| 7 | `ApplySync` | One transaction: verify the staged rows against the count from step 4, `MERGE` the delta (insert new / update genuinely changed) and advance the watermark. Returns run statistics. |
 
 ### Design decisions worth knowing
 
@@ -63,30 +61,44 @@ surface a cursor from a GraphQL POST body, so the pipeline drives `skip` itself.
 `rowsCopied < pageSize`. (ADF variables cannot self-reference, hence the `DataSkip` / `DataSkipNext`
 pairs.)
 
-**The key scan is ordered by the primary key on purpose — this is a correctness choice, not a
-stylistic one.** `restaurantKeys` sorts by `RestaurantId`; the delta scan sorts by
-`(LastUpdatedDateTime, RestaurantId)`. It is tempting to drop `restaurantKeys` and harvest keys from
-the general `restaurants` query instead, selecting only the id field — GraphQL makes that trivial,
-and the payload is the same size (636 vs 630 bytes per page, measured). Doing so would inherit that
-query's *mutable* sort key, and that is the problem: `OFFSET` paging assumes rows hold still. If a
-row ahead of the cursor is updated mid-scan it jumps to the end of a timestamp ordering, every row
-behind it shifts down one position, and the next `OFFSET` **skips a live row**. That key is then
-missing from `stg.RestaurantKey`, and the reconciliation `DELETE` cannot distinguish "missing because
-skipped" from "missing because deleted at source". Sorting by an immutable key means updates cannot
-reorder anything. Sync workloads see far more updates than deletes, so this — not payload size — is
-what the dedicated operation buys.
+**The source watermark comes from the same operation that returns the data.** The API has a single
+operation, `restaurants`. A real GraphQL service rarely offers a dedicated "watermark" or "keys"
+query, so the pipeline does not rely on one. To learn the current high-water mark it asks for the
+newest change after the stored watermark and reads only the first row:
+
+```graphql
+query($updatedAfter: String) {
+  restaurants(updatedAfter: $updatedAfter, sort: LAST_UPDATED_DESC, skip: 0) {
+    items { lastUpdatedDateTime }
+  }
+}
+```
+
+The first row carries the highest `lastUpdatedDateTime`. No rows means nothing changed since the last
+run, so `SetNewWatermark` keeps the stored value and the delta window is empty. The page can still hold
+up to 30 rows, but selecting one field keeps it small.
+
+What the pipeline needs from an API for this to work:
+
+* a **filter on the audit timestamp** — `updatedAfter` / `updatedThrough`, or any equivalent range;
+* a **total count** of the rows that match a filter (`totalCount`), for the guard in `ApplySync`;
+* a way to **read the newest change** — a sort that the caller controls, newest first. If the API
+  cannot sort that way but returns rows in ascending timestamp order by default, read the *last* page
+  of the delta instead: take `totalCount`, ask for `skip = ((totalCount - 1) div 30) * 30` and use the
+  last row. Rows that change between those two calls fall outside the pinned window, so the next run
+  picks them up.
 
 **Offset paging is safe in this sample, but would not be on a busy source.** The sample source is
 static while a run is in flight, so no scan can drift. Against a live table the delta scan has a
-narrower version of the same risk: its window is bounded by a pinned `updatedThrough`, so a row
-updated past that bound leaves the result set mid-scan and shifts the rows behind it. Because the
+risk: its window is bounded by a pinned `updatedThrough`, so a row updated past that bound leaves the
+result set mid-scan and shifts the rows behind it, and `OFFSET` assumes rows hold still. Because the
 watermark advances to `MAX(LastUpdatedDateTime)` over the rows that were *actually staged*, a skipped
 row whose timestamp falls below that maximum would be missed permanently rather than retried. The
-`@ExpectedKeyCount` / `@ExpectedDeltaCount` guards turn that into a failed run rather than silent
-data loss — a drifting scan produces a count mismatch — but note the converse: on a source with
-constant write traffic those guards will trip regularly, because the counts are sampled before the
-scans begin. Failing often is the correct behaviour for offset paging on a moving table; the answer
-is to stop using offset paging, not to loosen the guards.
+`@ExpectedDeltaCount` guard turns that into a failed run rather than silent data loss — a drifting
+scan produces a count mismatch — but note the converse: on a source with constant write traffic that
+guard will trip regularly, because the count is sampled before the scan begins. Failing often is the
+correct behaviour for offset paging on a moving table; the answer is to stop using offset paging, not
+to loosen the guard.
 
 The production fix is keyset (cursor) pagination — resume from the last value seen, not from a row
 count, so shifting rows are irrelevant:
@@ -111,35 +123,42 @@ shape constrains the sort key to an **enum** rather than free text. The spelling
 Hasura `order_by: { created_at: desc }`, HotChocolate `[UseSorting]`), but all of them generate a
 closed set of values from the schema. An API that accepts a free-text column *name* is a red flag:
 column names cannot be parameterized, so it is an injection risk in naive implementations and an easy
-denial of service in all of them, since an unindexed sort means a table scan and a sort spill.
+denial of service in all of them, since an unindexed sort means a table scan and a sort spill. This
+sample's `sort: RestaurantSort` is a two-value enum for that reason.
 
-**Both halves of the load are verified before anything is applied.** `usp_ApplyRestaurantSync`
-compares the staged key set against the row count the API reported at the start of the run
-(`@ExpectedKeyCount`, error `50001`) *and* the staged delta against the number of rows the API
-reported inside the watermark window (`@ExpectedDeltaCount`, error `50003`). The second guard exists
-because a GraphQL error arrives with HTTP 200: the Copy activity still "succeeds" but stages no rows,
-which is indistinguishable from a short final page, so the paging loop ends early. Without the check
-a partial delta would be merged *and the watermark would still advance*, and the rows that were
-missed would never be revisited. Both guards fail the whole run instead of applying a partial result
-— the watermark only moves on a complete load, so any failure is recovered by simply running again.
+**The load is verified before anything is applied.** `usp_ApplyRestaurantSync` compares the number of
+distinct staged rows against the number of rows the API reported inside the watermark window at the
+start of the run (`@ExpectedDeltaCount`, error `50001`). The guard exists because a GraphQL error
+arrives with HTTP 200: the Copy activity still "succeeds" but stages no rows, which is
+indistinguishable from a short final page, so the paging loop ends early. Without the check a
+partial delta would be merged *and the watermark would still advance*, and the rows that were missed
+would never be revisited. The guard fails the whole run instead of applying a partial result — the
+watermark only moves on a complete load, so any failure is recovered by simply running again. The
+parameter is required, and passing `NULL` fails the guard as well, so a caller cannot skip the check
+by leaving the count out.
 
-Both counts are `COUNT_BIG(DISTINCT RestaurantId)`, not `COUNT_BIG(1)`, and that distinction matters
-in both directions. Every Copy activity has a retry policy, so a retry that fires after rows were
-already committed leaves duplicates in staging; the `MERGE` and the `DELETE` are set-based and
-already tolerate that, so a raw row count would be the only thing in the procedure that fails a run
-purely because a page was retried. In the other direction, `stg.RestaurantKey.RestaurantId` is
-deliberately nullable so a malformed page lands as `NULL` rather than failing the copy — and a raw
-count would happily count those `NULL`s toward the expected total, letting an incomplete key harvest
-pass the guard and delete live rows. Counting distinct non-`NULL` keys is what closes both.
+The count is `COUNT_BIG(DISTINCT RestaurantId)`, not `COUNT_BIG(1)`, and that distinction matters in
+both directions. Every Copy activity has a retry policy, so a retry that fires after rows were already
+committed leaves duplicates in staging; the `MERGE` is set-based and already tolerates that, so a raw
+row count would be the only thing in the procedure that fails a run purely because a page was
+retried. In the other direction, the staging columns are deliberately nullable so a malformed page
+lands as `NULL` rather than failing the copy — and a raw count would happily count those unusable
+rows toward the expected total, letting an incomplete load pass the guard. Counting distinct
+non-`NULL` keys is what closes both.
 
 **`MERGE` updates only genuinely changed rows** using `EXISTS (SELECT s.* EXCEPT SELECT t.*)`, which
 is NULL-safe, and reports counts via `OUTPUT $action`.
 
-**`ApplySync` is a `Lookup`, not a stored-procedure activity**, so the insert/update/delete counts
+**`ApplySync` is a `Lookup`, not a stored-procedure activity**, so the insert/update counts
 come back in the pipeline output where tests and monitoring can see them.
 
 **`etl` procedures run `WITH EXECUTE AS OWNER`**, so the ADF identity needs only
 `EXECUTE ON SCHEMA::etl` — not the `ALTER` permission that `TRUNCATE TABLE` normally requires.
+
+**There is no deletion tracking, on purpose.** The source never deletes rows, so every change shows
+up in a watermark delta and the destination only ever inserts and updates. A source that does delete
+rows would need more: a soft-delete flag or tombstone exposed by the API, or a separate pass that
+reconciles the full key set, with a guard so that an incomplete key scan can never wipe the target.
 
 ### Why not Mapping Data Flows?
 
@@ -157,12 +176,12 @@ means URL-encoding GraphQL documents. Data flows also issue N+1 requests for N p
 extra call is made to infer the schema.
 
 **The load half is possible, but worse here.** An `AlterRow` transformation into an Azure SQL sink
-with `insertable`/`updateable`/`deletable` would express the same intent, but it would give up:
+with `insertable`/`updateable` would express the same intent, but it would give up:
 
-* **Atomicity** — the merge, the delete and the watermark advance are currently one transaction; a
-  sink cannot span that with the watermark update.
-* **The safety guards** — the `@ExpectedKeyCount` / `@ExpectedDeltaCount` checks that abort the run
-  when either harvest was incomplete are a few lines of T-SQL and awkward to express in a data flow.
+* **Atomicity** — the merge and the watermark advance are currently one transaction; a sink cannot
+  span that with the watermark update.
+* **The safety guard** — the `@ExpectedDeltaCount` check that aborts the run when the harvest was
+  incomplete is a few lines of T-SQL and awkward to express in a data flow.
 * **Cost and start-up time** — data flows need a Spark cluster (roughly 4–6 minutes cold, about a
   minute on a TTL-enabled integration runtime). The whole pipeline currently finishes in 2–3 minutes
   with no cluster at all.
@@ -191,18 +210,18 @@ sql/
   03-dest-schema.sql            Destination tables, watermark control, etl.* procedures (idempotent)
   04-dest-grant-adf-sami.sql    ADF SAMI -> db_datareader + db_datawriter + EXECUTE ON SCHEMA::etl
   04-dest-grant-adf-sami-prd.sql  The same grants for the production factory's SAMI
-  05-source-changes.sql         Test fixture: 3 updates, 2 inserts, 2 deletes
+  05-source-changes.sql         Test fixture: 3 updates, 2 inserts
 
 src/GraphQlApi/               .NET 10 ASP.NET Core minimal API + HotChocolate 16
   Program.cs                    Hosting, GraphQL server, /healthz
-  GraphQL/Query.cs              Read-only root query (no mutations)
+  GraphQL/Query.cs              Read-only root query, one operation (no mutations)
   Data/RestaurantRepository.cs  All SQL access, page size 30, transient-error retry
-  Models/                       Restaurant, RestaurantKey, SyncWatermark, Page<T>
+  Models/                       Restaurant, RestaurantSort, Page<T>
 
 adf/                            The factory's first version, deployed by Deploy-Adf.ps1. The ADF Git
                                 repository is now the source of truth (see CI/CD and production).
   linkedService/                LS_GraphQlApi (anonymous REST), LS_DestinationSql (SAMI)
-  dataset/                      REST source + three Azure SQL datasets
+  dataset/                      REST source + two Azure SQL datasets
   pipeline/                     PL_Sync_Restaurants_GraphQL_To_Sql
 
 scripts/
@@ -256,7 +275,8 @@ cd scripts
 connected to Git, and its artifacts now live in their own repository,
 [adf-graphql-to-sql-adf-source](https://github.com/fmushinsky-at-msft/adf-graphql-to-sql-adf-source),
 in the collaboration branch `collab`. That repository is the source of truth for the pipeline:
-change it in ADF Studio, not in `adf/`, which is no longer updated.
+change it in ADF Studio. `adf/` keeps a copy that `Deploy-Adf.ps1` can use to bootstrap a new
+factory, so update it by hand to match.
 
 A GitHub Actions workflow in that repository follows the
 [new CI/CD flow](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery-improvements)
@@ -306,14 +326,18 @@ Send `Accept: application/json`. Without it HotChocolate replies with
 
 ```graphql
 type Query {
-  "One page (30 rows) of restaurants, optionally restricted to a watermark window."
-  restaurants(updatedAfter: String, updatedThrough: String, skip: Int! = 0): PageOfRestaurant!
+  "One page (30 rows) of restaurants, optionally restricted to a watermark window. The only operation."
+  restaurants(
+    updatedAfter: String     # exclusive lower bound on lastUpdatedDateTime
+    updatedThrough: String   # inclusive upper bound on lastUpdatedDateTime
+    sort: RestaurantSort! = LAST_UPDATED_ASC
+    skip: Int! = 0
+  ): PageOfRestaurant!
+}
 
-  "One page (30 rows) of primary keys for every row that currently exists at the source."
-  restaurantKeys(skip: Int! = 0): PageOfRestaurantKey!
-
-  "Current high-water mark and row count of the source table."
-  restaurantWatermark: SyncWatermark!
+enum RestaurantSort {
+  LAST_UPDATED_ASC    # oldest change first (the default): the order to page a delta in
+  LAST_UPDATED_DESC   # newest change first: with skip 0 the first row is the current watermark
 }
 
 type Restaurant {
@@ -329,17 +353,6 @@ type Restaurant {
   lastUpdatedDateTime: String!  # yyyy-MM-ddTHH:mm:ss.fff  (UTC)
 }
 
-type RestaurantKey {
-  restaurantId: Int!
-}
-
-type SyncWatermark {
-  maxLastUpdatedDateTime: String   # null only when the table is empty
-  rowCount: Int!
-  serverUtcNow: String!
-}
-
-# PageOfRestaurant / PageOfRestaurantKey
 type PageOfRestaurant {
   items: [Restaurant!]!
   pageSize: Int!        # always 30
@@ -359,6 +372,15 @@ curl -s https://<app-service>/graphql \
   -d '{"query":"query($a:String,$t:String,$s:Int!){ restaurants(updatedAfter:$a,updatedThrough:$t,skip:$s){ totalCount hasNextPage nextSkip items{ restaurantId name lastUpdatedDateTime } } }","variables":{"a":"2026-09-01T00:00:00.000","t":"2026-09-14T12:00:01.728","s":0}}'
 ```
 
+Example watermark probe: the newest change after a point in time. The first item is the current
+high-water mark, and an empty `items` list means nothing changed since then:
+
+```bash
+curl -s https://<app-service>/graphql \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{"query":"query($a:String){ restaurants(updatedAfter:$a,sort:LAST_UPDATED_DESC,skip:0){ items{ lastUpdatedDateTime } } }","variables":{"a":"2026-09-01T00:00:00.000"}}'
+```
+
 ---
 
 ## Testing
@@ -370,16 +392,18 @@ cd scripts
 
 | Test | Scenario | Expected |
 |------|----------|----------|
-| 1 | Full load into an empty destination | 75 inserted, 0 updated, 0 deleted |
-| 2 | Re-run with no source changes | **0 delta rows read**, 0/0/0 |
-| 3 | 3 rows updated, 2 inserted, 2 deleted at the source | 2 inserted, 3 updated, 2 deleted |
+| 1 | Full load into an empty destination | 75 inserted, 0 updated |
+| 2 | Re-run with no source changes | **0 delta rows read**, 0 inserted, 0 updated |
+| 3 | 3 rows updated, 2 inserted at the source | 2 inserted, 3 updated, 77 rows in the destination |
 
 After every run the destination is fingerprinted against the source with SHA2-256 over **all**
 columns, including millisecond timestamps, so "it ran" is never mistaken for "it is correct".
 The suite restores the source table and empties the destination when it finishes.
 
 Test 2 is the important one. If a single millisecond is lost anywhere in the watermark round trip,
-the newest row is re-read on **every** run forever. Individual pieces can also be run on their own:
+the newest row is re-read on **every** run forever. It also covers the empty-window path: the
+watermark probe returns no rows, so the stored watermark stays where it was. Individual pieces can
+also be run on their own:
 
 ```powershell
 ./Reset-Destination.ps1      # empty the target, rewind the watermark
@@ -449,9 +473,10 @@ inconsistent string width between runs. `FORMAT(value, 'yyyy-MM-ddTHH:mm:ss.fff'
 instead — the culture must be explicit because `:` is a culture-dependent time separator in .NET
 custom format strings.
 
-**11. ADF artifacts are deployed by PUTting JSON to the management API**, not via an ARM template.
-ARM would try to evaluate JSONPath column mappings such as `['restaurantId']` as expressions,
-because they start with `[`.
+**11. `Deploy-Adf.ps1` PUTs the JSON to the management API** instead of deploying a hand-written ARM
+template. ARM would try to evaluate JSONPath column mappings such as `['restaurantId']` as
+expressions, because they start with `[`. The template that the ADF utilities export for the
+workflow escapes them (`[['restaurantId']`), so it deploys correctly.
 
 **12. PowerShell:** `DataTable.Load($reader)` advances the reader itself, so a manual `NextResult()`
 loop silently skips result sets — use `SqlDataAdapter.Fill($dataSet)`. And returning a `DataTable`

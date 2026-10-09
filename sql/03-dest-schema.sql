@@ -5,7 +5,6 @@
 
 	 dbo.Restaurant        Target table. Starts empty and is filled incrementally.
 	 stg.Restaurant        Landing zone for the delta rows of the current pipeline run.
-	 stg.RestaurantKey     Landing zone for the full source key set, used to detect deletes.
 	 dbo.WatermarkControl  Stores the high-water mark plus run statistics.
 	 etl.usp_*             The procedures the pipeline calls.
 
@@ -24,7 +23,6 @@ DROP PROCEDURE IF EXISTS etl.usp_ApplyRestaurantSync;
 DROP PROCEDURE IF EXISTS etl.usp_GetWatermark;
 DROP PROCEDURE IF EXISTS etl.usp_ResetRestaurantTarget;
 DROP TABLE IF EXISTS stg.Restaurant;
-DROP TABLE IF EXISTS stg.RestaurantKey;
 DROP TABLE IF EXISTS dbo.Restaurant;
 DROP TABLE IF EXISTS dbo.WatermarkControl;
 GO
@@ -70,12 +68,6 @@ CREATE TABLE stg.Restaurant
 );
 GO
 
-CREATE TABLE stg.RestaurantKey
-(
-	RestaurantId INT NULL
-);
-GO
-
 /* --------------------------------------------------------------- watermark control -- */
 CREATE TABLE dbo.WatermarkControl
 (
@@ -86,7 +78,6 @@ CREATE TABLE dbo.WatermarkControl
 	LastSyncEndDateTime   DATETIME2(3) NULL,
 	LastRowsInserted      INT          NULL,
 	LastRowsUpdated       INT          NULL,
-	LastRowsDeleted       INT          NULL,
 	CONSTRAINT PK_WatermarkControl PRIMARY KEY CLUSTERED (TableName)
 );
 GO
@@ -122,7 +113,7 @@ BEGIN
 END;
 GO
 
-/* Clears the staging tables so a run always starts from a clean slate, even after a failure. */
+/* Clears the staging table so a run always starts from a clean slate, even after a failure. */
 CREATE PROCEDURE etl.usp_StartRestaurantSync
 WITH EXECUTE AS OWNER
 AS
@@ -130,7 +121,6 @@ BEGIN
 	SET NOCOUNT ON;
 
 	TRUNCATE TABLE stg.Restaurant;
-	TRUNCATE TABLE stg.RestaurantKey;
 
 	UPDATE dbo.WatermarkControl
 		SET LastSyncStartDateTime = SYSUTCDATETIME()
@@ -143,17 +133,16 @@ GO
 
 	 1. INSERT rows that are new.
 	 2. UPDATE rows whose non-key column values actually changed.
-	 3. DELETE rows that no longer exist at the source.
-	 4. Advance the watermark.
+	 3. Advance the watermark.
 
-   @ExpectedKeyCount is the source row count reported by the API at the start of the run.
-   If the staged key set does not match it, the key harvest was incomplete and the whole run is
-   aborted so an interrupted run can never wipe the target table.
+   Rows are never deleted. The source system does not delete records, so a watermark delta
+   is everything there is to reconcile.
 
-   @ExpectedDeltaCount is the number of rows the API reported inside the watermark window, and
-   guards the delta half the same way. Both guards deliberately fail the run rather than applying
-   a partial result: the watermark only advances on a complete load, so a failure is always
-   recoverable by simply running again.
+   @ExpectedDeltaCount is the number of rows the API reported inside the watermark window at the
+   start of the run. If the staged delta does not match it, the load was incomplete and the whole
+   run is aborted rather than applying a partial result: the watermark only advances on a complete
+   load, so a failure is always recoverable by simply running again. The parameter is required on
+   purpose - a call that omitted it would skip the only safeguard.
 
    The new watermark is deliberately NOT passed in as a parameter. Azure Data Factory coerces any
    stored procedure argument that looks like a timestamp through a DateTime and re-formats it at
@@ -167,8 +156,7 @@ GO
    was staged the watermark simply stays where it was.
    ===================================================================================== */
 CREATE PROCEDURE etl.usp_ApplyRestaurantSync
-	@ExpectedKeyCount   INT,
-	@ExpectedDeltaCount INT = NULL
+	@ExpectedDeltaCount INT
 WITH EXECUTE AS OWNER
 AS
 BEGIN
@@ -184,41 +172,30 @@ BEGIN
 
 	DECLARE @mergeActions TABLE (MergeAction NVARCHAR(10) NOT NULL);
 
-	/* Both counts are DISTINCT and non-NULL on purpose, and each half matters for a different
-	   reason. Every Copy activity has a retry policy, and a retry that happens after rows were
-	   already committed leaves duplicates in staging; the merge and the delete are both set-based
-	   and already tolerate that, so counting raw rows would be the only thing in the procedure
-	   that fails a run purely because a page was retried. The staging key column is also
-	   deliberately nullable so a malformed page lands as NULL instead of failing the copy - and a
-	   raw count would count those NULLs toward the expected total, letting an incomplete key
-	   harvest pass this guard and then delete live rows. */
+	/* The count is DISTINCT and non-NULL on purpose. Every Copy activity has a retry policy, and a
+	   retry that happens after rows were already committed leaves duplicates in staging; the merge
+	   already tolerates that, so counting raw rows would be the only thing in the procedure that
+	   fails a run purely because a page was retried. The staging columns are also deliberately
+	   nullable so a malformed page lands as NULL instead of failing the copy - and a raw count
+	   would count those unusable rows toward the expected total, letting an incomplete load pass
+	   this guard. */
 	DECLARE @inserted INT = 0,
 			@updated  INT = 0,
-			@deleted  INT = 0,
-			@stagedKeyCount   INT = (SELECT COUNT_BIG(DISTINCT RestaurantId) FROM stg.RestaurantKey WHERE RestaurantId IS NOT NULL),
 			@stagedDeltaCount INT = (SELECT COUNT_BIG(DISTINCT RestaurantId) FROM stg.Restaurant WHERE RestaurantId IS NOT NULL);
 
-	IF @ExpectedKeyCount IS NOT NULL AND @stagedKeyCount <> @ExpectedKeyCount
+	/* Without this guard a GraphQL error - which is returned with HTTP 200, so the Copy activity
+	   still "succeeds" but stages no rows - would look like a short page, end the paging loop
+	   early, merge a partial delta and still advance the watermark. Rows missed that way are
+	   never revisited, because the watermark moves past them. Failing here instead leaves the
+	   watermark untouched so the next run retries. */
+	IF @ExpectedDeltaCount IS NULL OR @stagedDeltaCount <> @ExpectedDeltaCount
 	BEGIN
 		DECLARE @message NVARCHAR(400) =
-			CONCAT(N'Key reconciliation aborted: staged ', @stagedKeyCount,
-					   N' distinct key(s) but the source reported ', @ExpectedKeyCount,
-				   N'. Stale rows will not be deleted this run.');
-		THROW 50001, @message, 1;
-	END
-
-	/* The same guard for the delta half. Without it a GraphQL error - which is returned with
-	   HTTP 200, so the Copy activity still "succeeds" but stages no rows - would look like a
-	   short page, end the paging loop early, merge a partial delta and still advance the
-	   watermark. Rows missed that way are never revisited, because the watermark moves past
-	   them. Failing here instead leaves the watermark untouched so the next run retries. */
-	IF @ExpectedDeltaCount IS NOT NULL AND @stagedDeltaCount <> @ExpectedDeltaCount
-	BEGIN
-		DECLARE @deltaMessage NVARCHAR(400) =
 			CONCAT(N'Delta load aborted: staged ', @stagedDeltaCount,
-				   N' distinct row(s) but the source reported ', @ExpectedDeltaCount,
+				   N' distinct row(s) but the source reported ',
+				   ISNULL(CONVERT(NVARCHAR(20), @ExpectedDeltaCount), N'no count'),
 				   N' in the watermark window. The watermark will not advance this run.');
-		THROW 50003, @deltaMessage, 1;
+		THROW 50001, @message, 1;
 	END
 
 	BEGIN TRANSACTION;
@@ -282,23 +259,11 @@ BEGIN
 		@updated  = SUM(CASE WHEN MergeAction = 'UPDATE' THEN 1 ELSE 0 END)
 	FROM @mergeActions;
 
-	/* Deletes can never appear in a watermark delta, so they are found by reconciling the
-	   target against the full key set harvested from the source in this same run. */
-	IF @ExpectedKeyCount IS NOT NULL
-	BEGIN
-		DELETE t
-		FROM dbo.Restaurant AS t
-		WHERE NOT EXISTS (SELECT 1 FROM stg.RestaurantKey AS k WHERE k.RestaurantId = t.RestaurantId);
-
-		SET @deleted = @@ROWCOUNT;
-	END
-
 	UPDATE dbo.WatermarkControl
 		SET WatermarkValue      = @watermark,
 			LastSyncEndDateTime = SYSUTCDATETIME(),
 			LastRowsInserted    = ISNULL(@inserted, 0),
-			LastRowsUpdated     = ISNULL(@updated, 0),
-			LastRowsDeleted     = @deleted
+			LastRowsUpdated     = ISNULL(@updated, 0)
 	WHERE TableName = N'demo.Restaurant';
 
 	COMMIT TRANSACTION;
@@ -306,7 +271,6 @@ BEGIN
 	SELECT
 		RowsInserted   = ISNULL(@inserted, 0),
 		RowsUpdated    = ISNULL(@updated, 0),
-		RowsDeleted    = @deleted,
 		NewWatermark   = FORMAT(@watermark, 'yyyy-MM-ddTHH:mm:ss.fff', 'en-US'),
 		TargetRowCount = (SELECT COUNT_BIG(1) FROM dbo.Restaurant);
 END;
@@ -321,15 +285,13 @@ BEGIN
 
 	TRUNCATE TABLE dbo.Restaurant;
 	TRUNCATE TABLE stg.Restaurant;
-	TRUNCATE TABLE stg.RestaurantKey;
 
 	UPDATE dbo.WatermarkControl
 		SET WatermarkValue        = '1900-01-01T00:00:00.000',
 			LastSyncStartDateTime = NULL,
 			LastSyncEndDateTime   = NULL,
 			LastRowsInserted      = NULL,
-			LastRowsUpdated       = NULL,
-			LastRowsDeleted       = NULL
+			LastRowsUpdated       = NULL
 	WHERE TableName = N'demo.Restaurant';
 END;
 GO

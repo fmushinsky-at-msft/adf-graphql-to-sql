@@ -35,6 +35,12 @@ public sealed class RestaurantRepository(IConfiguration configuration, ILogger<R
         r.LastUpdatedDateTime
         """;
 
+    // The ORDER BY text is picked from this closed set by the RestaurantSort enum. Caller input is
+    // never concatenated into SQL, and a column name could not be parameterized anyway.
+    private static readonly string PageSqlOldestFirst = BuildPageSql("r.LastUpdatedDateTime, r.RestaurantId");
+
+    private static readonly string PageSqlNewestFirst = BuildPageSql("r.LastUpdatedDateTime DESC, r.RestaurantId DESC");
+
     // Azure SQL serverless databases auto-pause. The first request after an idle period fails with
     // 40613 while the database resumes, so transient failures are retried here. Resuming a paused
     // database routinely takes over a minute, so the retry budget below is deliberately generous.
@@ -48,30 +54,24 @@ public sealed class RestaurantRepository(IConfiguration configuration, ILogger<R
 
     /// <summary>
     /// Returns one page of rows, optionally restricted to a watermark window.
-    /// Ordering is by (LastUpdatedDateTime, RestaurantId) so that offset paging is deterministic.
+    /// Both orderings end in <c>RestaurantId</c>, so rows that share a timestamp keep a fixed
+    /// position and offset paging is deterministic.
     /// </summary>
     public async Task<Page<Restaurant>> GetRestaurantsAsync(
         DateTime? updatedAfter,
         DateTime? updatedThrough,
+        RestaurantSort sort,
         int skip,
         CancellationToken cancellationToken)
     {
         skip = Math.Max(0, skip);
 
-        const string sql = $"""
-            SELECT COUNT_BIG(1)
-            FROM demo.Restaurant AS r
-            WHERE (@updatedAfter   IS NULL OR r.LastUpdatedDateTime >  @updatedAfter)
-              AND (@updatedThrough IS NULL OR r.LastUpdatedDateTime <= @updatedThrough);
-
-            SELECT
-                {ProjectionColumns}
-            FROM demo.Restaurant AS r
-            WHERE (@updatedAfter   IS NULL OR r.LastUpdatedDateTime >  @updatedAfter)
-              AND (@updatedThrough IS NULL OR r.LastUpdatedDateTime <= @updatedThrough)
-            ORDER BY r.LastUpdatedDateTime, r.RestaurantId
-            OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
-            """;
+        var sql = sort switch
+        {
+            RestaurantSort.LastUpdatedAsc => PageSqlOldestFirst,
+            RestaurantSort.LastUpdatedDesc => PageSqlNewestFirst,
+            _ => throw new ArgumentOutOfRangeException(nameof(sort), sort, "Unsupported sort order.")
+        };
 
         return await ExecuteWithRetryAsync(async connection =>
         {
@@ -114,75 +114,20 @@ public sealed class RestaurantRepository(IConfiguration configuration, ILogger<R
         }, cancellationToken);
     }
 
-    /// <summary>
-    /// Returns one page of primary keys ordered by <c>RestaurantId</c>. Consumers page through the
-    /// full key set to detect rows that were hard-deleted at the source.
-    /// </summary>
-    public async Task<Page<RestaurantKey>> GetRestaurantKeysAsync(int skip, CancellationToken cancellationToken)
-    {
-        skip = Math.Max(0, skip);
+    private static string BuildPageSql(string orderBy) => $"""
+        SELECT COUNT_BIG(1)
+        FROM demo.Restaurant AS r
+        WHERE (@updatedAfter   IS NULL OR r.LastUpdatedDateTime >  @updatedAfter)
+          AND (@updatedThrough IS NULL OR r.LastUpdatedDateTime <= @updatedThrough);
 
-        const string sql = """
-            SELECT COUNT_BIG(1) FROM demo.Restaurant;
-
-            SELECT r.RestaurantId
-            FROM demo.Restaurant AS r
-            ORDER BY r.RestaurantId
-            OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
-            """;
-
-        return await ExecuteWithRetryAsync(async connection =>
-        {
-            await using var command = new SqlCommand(sql, connection);
-            command.Parameters.Add("@skip", System.Data.SqlDbType.Int).Value = skip;
-            command.Parameters.Add("@take", System.Data.SqlDbType.Int).Value = PageSize;
-
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-
-            await reader.ReadAsync(cancellationToken);
-            var totalCount = (int)reader.GetInt64(0);
-
-            await reader.NextResultAsync(cancellationToken);
-
-            var items = new List<RestaurantKey>(PageSize);
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                items.Add(new RestaurantKey(reader.GetInt32(0)));
-            }
-
-            return new Page<RestaurantKey>
-            {
-                Items = items,
-                PageSize = PageSize,
-                Skip = skip,
-                TotalCount = totalCount
-            };
-        }, cancellationToken);
-    }
-
-    /// <summary>Returns the current high-water mark and row count of the source table.</summary>
-    public async Task<SyncWatermark> GetWatermarkAsync(CancellationToken cancellationToken)
-    {
-        const string sql = """
-            SELECT
-                MaxLastUpdatedDateTime = MAX(r.LastUpdatedDateTime),
-                RowCount_             = COUNT_BIG(1),
-                ServerUtcNow          = SYSUTCDATETIME()
-            FROM demo.Restaurant AS r;
-            """;
-
-        return await ExecuteWithRetryAsync(async connection =>
-        {
-            await using var command = new SqlCommand(sql, connection);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            await reader.ReadAsync(cancellationToken);
-
-            return new SyncWatermark(
-                MaxLastUpdatedDateTime: reader.IsDBNull(0) ? null : FormatTimestamp(reader.GetDateTime(0)),
-                RowCount: (int)reader.GetInt64(1),
-                ServerUtcNow: FormatTimestamp(reader.GetDateTime(2)));
-        }, cancellationToken);
-    }
+        SELECT
+            {ProjectionColumns}
+        FROM demo.Restaurant AS r
+        WHERE (@updatedAfter   IS NULL OR r.LastUpdatedDateTime >  @updatedAfter)
+          AND (@updatedThrough IS NULL OR r.LastUpdatedDateTime <= @updatedThrough)
+        ORDER BY {orderBy}
+        OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY;
+        """;
 
     private static string FormatTimestamp(DateTime value) =>
         value.ToString(TimestampFormat, System.Globalization.CultureInfo.InvariantCulture);

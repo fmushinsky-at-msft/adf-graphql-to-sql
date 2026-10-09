@@ -9,6 +9,8 @@
 
 	Artifacts are deployed in dependency order: linked services, then datasets, then pipelines.
 
+	The script only creates and updates artifacts. An artifact that was removed from adf\ stays
+	in the factory until it is deleted there (for example, a dataset the pipeline no longer uses).
 .EXAMPLE
 	.\Deploy-Adf.ps1
 #>

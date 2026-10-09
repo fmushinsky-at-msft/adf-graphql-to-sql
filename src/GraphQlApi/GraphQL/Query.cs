@@ -12,15 +12,20 @@ public sealed class Query
 {
     /// <summary>
     /// Returns one page (30 rows) of restaurants, optionally restricted to a watermark window.
+    /// This is the only operation: a consumer reads the current high-water mark from it too, by
+    /// asking for the newest change first (<c>sort: LAST_UPDATED_DESC, skip: 0</c>).
     /// </summary>
     /// <param name="updatedAfter">
     /// Exclusive lower bound on <c>lastUpdatedDateTime</c>. Pass the previously stored watermark.
     /// UTC, ISO-8601, no offset (for example <c>2026-09-14T12:00:01.000</c>). Omit for a full load.
     /// </param>
     /// <param name="updatedThrough">
-    /// Inclusive upper bound on <c>lastUpdatedDateTime</c>. Pass the value returned by
-    /// <c>restaurantWatermark.maxLastUpdatedDateTime</c> at the start of the run so that the
-    /// result set stays stable while the consumer pages through it.
+    /// Inclusive upper bound on <c>lastUpdatedDateTime</c>. Pass the newest <c>lastUpdatedDateTime</c>
+    /// read at the start of the run so that the result set stays stable while the consumer pages
+    /// through it.
+    /// </param>
+    /// <param name="sort">
+    /// Row order. Defaults to oldest change first, the order to page a delta in.
     /// </param>
     /// <param name="skip">Zero-based row offset. Use <c>nextSkip</c> from the previous page.</param>
     public Task<Page<Restaurant>> GetRestaurantsAsync(
@@ -28,32 +33,14 @@ public sealed class Query
         CancellationToken cancellationToken,
         string? updatedAfter = null,
         string? updatedThrough = null,
+        RestaurantSort sort = RestaurantSort.LastUpdatedAsc,
         int skip = 0) =>
         repository.GetRestaurantsAsync(
             ParseTimestamp(updatedAfter, nameof(updatedAfter)),
             ParseTimestamp(updatedThrough, nameof(updatedThrough)),
+            sort,
             skip,
             cancellationToken);
-
-    /// <summary>
-    /// Returns one page (30 rows) of primary keys for every row that currently exists at the
-    /// source. Consumers reconcile this against their copy to find rows that were deleted.
-    /// </summary>
-    /// <param name="skip">Zero-based row offset. Use <c>nextSkip</c> from the previous page.</param>
-    public Task<Page<RestaurantKey>> GetRestaurantKeysAsync(
-        RestaurantRepository repository,
-        CancellationToken cancellationToken,
-        int skip = 0) =>
-        repository.GetRestaurantKeysAsync(skip, cancellationToken);
-
-    /// <summary>
-    /// Returns the current high-water mark of the source table. Read this once at the start of an
-    /// incremental load and use it as the upper bound of the delta window.
-    /// </summary>
-    public Task<SyncWatermark> GetRestaurantWatermarkAsync(
-        RestaurantRepository repository,
-        CancellationToken cancellationToken) =>
-        repository.GetWatermarkAsync(cancellationToken);
 
     private static DateTime? ParseTimestamp(string? value, string argumentName)
     {

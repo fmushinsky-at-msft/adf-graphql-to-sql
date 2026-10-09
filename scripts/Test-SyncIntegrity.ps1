@@ -8,7 +8,7 @@
 	identical millisecond-precision timestamp format. If the two fingerprints match, the sync is
 	byte-for-byte correct - including audit timestamps.
 
-	Also reports any keys that are missing from, or extra in, the destination.
+	Also reports any keys that are missing from, or only present in, the destination.
 
 .EXAMPLE
 	.\Test-SyncIntegrity.ps1
@@ -125,7 +125,7 @@ $missing = $sourceKeys | Where-Object { $destKeys -notcontains $_ }
 $extra   = $destKeys   | Where-Object { $sourceKeys -notcontains $_ }
 
 if ($missing) { Write-Host "  missing from destination : $($missing -join ', ')" -ForegroundColor Red }
-if ($extra)   { Write-Host "  stale in destination     : $($extra -join ', ')"   -ForegroundColor Red }
+if ($extra)   { Write-Host "  only in destination      : $($extra -join ', ')"   -ForegroundColor Red }
 if (-not $missing -and -not $extra) {
 	Write-Host '  key sets match, so one or more column values differ.' -ForegroundColor Red
 }

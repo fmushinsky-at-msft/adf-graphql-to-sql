@@ -4,7 +4,7 @@
 
 .DESCRIPTION
 	Starts PL_Sync_Restaurants_GraphQL_To_Sql, polls until the run reaches a terminal state,
-	then prints a per-activity summary plus the insert/update/delete counts returned by
+	then prints a per-activity summary plus the insert/update counts returned by
 	etl.usp_ApplyRestaurantSync. The same counts are emitted as an object so callers can
 	assert on them.
 
@@ -135,7 +135,6 @@ $deltaRows = $activities.value |
 	Status         = $status
 	RowsInserted   = [int] $apply.output.firstRow.RowsInserted
 	RowsUpdated    = [int] $apply.output.firstRow.RowsUpdated
-	RowsDeleted    = [int] $apply.output.firstRow.RowsDeleted
 	TargetRowCount = [int] $apply.output.firstRow.TargetRowCount
 	NewWatermark   = [string] $apply.output.firstRow.NewWatermark
 	DeltaRowsRead  = [int] $deltaRows.Sum

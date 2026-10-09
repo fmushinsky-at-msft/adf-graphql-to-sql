@@ -22,7 +22,6 @@ EXEC etl.usp_ResetRestaurantTarget;
 SELECT
 	TargetRows      = (SELECT COUNT_BIG(1) FROM dbo.Restaurant),
 	StagingRows     = (SELECT COUNT_BIG(1) FROM stg.Restaurant),
-	StagingKeyRows  = (SELECT COUNT_BIG(1) FROM stg.RestaurantKey),
 	WatermarkValue  = (SELECT CONVERT(CHAR(23), WatermarkValue, 126) FROM dbo.WatermarkControl WHERE TableName = N'demo.Restaurant');
 '@
 

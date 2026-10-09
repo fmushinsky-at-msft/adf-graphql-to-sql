@@ -11,8 +11,9 @@
 							 zero rows and nothing to be written. This is the regression test
 							 for watermark precision: if a single millisecond is lost anywhere
 							 the newest row is re-read on every run.
-	  3. Incremental change - 3 rows updated, 2 inserted, 2 deleted at the source; expect
-							 exactly 2 inserted / 3 updated / 2 deleted.
+	  3. Incremental change - 3 rows updated and 2 inserted at the source; expect
+							 exactly 2 inserted / 3 updated. The source never deletes rows,
+							 so there is no delete scenario.
 
 	After every pipeline run the destination is fingerprinted against the source
 	(SHA2-256 over all columns, including millisecond timestamps) so "it ran" is never
@@ -98,7 +99,6 @@ Reset-Destination
 $run = Invoke-Sync
 Assert-Value -What 'rows inserted'  -Expected 75 -Actual $run.RowsInserted
 Assert-Value -What 'rows updated'   -Expected 0  -Actual $run.RowsUpdated
-Assert-Value -What 'rows deleted'   -Expected 0  -Actual $run.RowsDeleted
 Assert-Value -What 'destination rows' -Expected 75 -Actual $run.TargetRowCount
 Assert-Value -What 'delta rows read' -Expected 75 -Actual $run.DeltaRowsRead
 Assert-Integrity
@@ -109,18 +109,16 @@ $run = Invoke-Sync
 Assert-Value -What 'delta rows read' -Expected 0 -Actual $run.DeltaRowsRead
 Assert-Value -What 'rows inserted'  -Expected 0  -Actual $run.RowsInserted
 Assert-Value -What 'rows updated'   -Expected 0  -Actual $run.RowsUpdated
-Assert-Value -What 'rows deleted'   -Expected 0  -Actual $run.RowsDeleted
 Assert-Value -What 'destination rows' -Expected 75 -Actual $run.TargetRowCount
 Assert-Integrity
 
 # --------------------------------------------------------------------------- test 3 --
-Write-Stage 'TEST 3 - incremental change: 3 updated, 2 inserted, 2 deleted'
+Write-Stage 'TEST 3 - incremental change: 3 updated, 2 inserted'
 Invoke-Sql -Database $SourceDatabase -Path (Join-Path $sql '05-source-changes.sql')
 $run = Invoke-Sync
 Assert-Value -What 'rows inserted'  -Expected 2 -Actual $run.RowsInserted
 Assert-Value -What 'rows updated'   -Expected 3 -Actual $run.RowsUpdated
-Assert-Value -What 'rows deleted'   -Expected 2 -Actual $run.RowsDeleted
-Assert-Value -What 'destination rows' -Expected 75 -Actual $run.TargetRowCount
+Assert-Value -What 'destination rows' -Expected 77 -Actual $run.TargetRowCount
 Assert-Value -What 'delta rows read' -Expected 5 -Actual $run.DeltaRowsRead
 Assert-Integrity
 
